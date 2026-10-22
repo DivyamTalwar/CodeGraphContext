@@ -34,7 +34,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path $env:CGC_VALIDATION_ROOT -ErrorAction Stop | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $env:CGC_VALIDATION_ROOT 'tmp') | Out-Null
-          'Pinned source: DivyamTalwar/CodeGraphContext@b0f74d99ffade2fb45794e49c6a12adf610112d4' |
+          'Pinned source: DivyamTalwar/CodeGraphContext@ff1b922fe06ea3e0dddf003c004637cf54e6dd76' |
             Set-Content (Join-Path $env:CGC_VALIDATION_ROOT 'bootstrap.log') -Encoding utf8NoBOM
           $disk = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($env:CGC_VALIDATION_ROOT))
           if ($disk.AvailableFreeSpace -lt 12000000000) { throw 'Resource gate: less than 12 GB free' }
@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: DivyamTalwar/CodeGraphContext
-          ref: b0f74d99ffade2fb45794e49c6a12adf610112d4
+          ref: ff1b922fe06ea3e0dddf003c004637cf54e6dd76
           path: source
           fetch-depth: 1
           persist-credentials: false
@@ -59,7 +59,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
           $actual = (& git rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actual -cne 'b0f74d99ffade2fb45794e49c6a12adf610112d4') {
+          if ($LASTEXITCODE -ne 0 -or $actual -cne 'ff1b922fe06ea3e0dddf003c004637cf54e6dd76') {
             throw "Unexpected checkout: $actual"
           }
           & git diff --exit-code -- .
@@ -121,7 +121,7 @@ jobs:
 
           root = Path(os.environ['CGC_VALIDATION_ROOT']).resolve()
           source = Path(os.environ['CGC_SOURCE_ROOT']).resolve()
-          expected_commit = 'b0f74d99ffade2fb45794e49c6a12adf610112d4'
+          expected_commit = 'ff1b922fe06ea3e0dddf003c004637cf54e6dd76'
           integration = 'tests/integration/test_watcher_watch_first.py'
           selection = [
               'tests/unit/core/test_watcher_repository_initialization.py',
@@ -297,7 +297,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: cgc1873-windows-b0f74d9-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cgc1873-windows-ff1b922-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
           path: |
