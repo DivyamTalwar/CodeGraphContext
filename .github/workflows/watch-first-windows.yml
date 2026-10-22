@@ -1,0 +1,276 @@
+name: CGC 1873 exact-source Windows watch-first validation
+
+# Isolated validation-only branch; does not alter the PR or default branch.
+# The workflow definition's branch never changes the pinned test source below.
+'on':
+  push:
+    branches: ['validation/watch-first-1873-20261023-5twknh']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-watch-first:
+    if: github.repository == 'DivyamTalwar/CodeGraphContext'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CGC_SOURCE_ROOT: ${{ github.workspace }}/source
+      CGC_VALIDATION_ROOT: ${{ runner.temp }}/cgc1873-${{ github.run_id }}-${{ github.run_attempt }}
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+      CGC_IGNORE_PROJECT_ENV: '1'
+      CGC_RUNTIME_DB_TYPE: ladybugdb
+      CGC_EMBEDDED_BUFFER_POOL_MB: '1024'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+    steps:
+      - name: Prepare this run's evidence directory
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $env:CGC_VALIDATION_ROOT -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $env:CGC_VALIDATION_ROOT 'tmp') | Out-Null
+          'Pinned source: DivyamTalwar/CodeGraphContext@63e4c8c7774cdac58c4790e01379a26db47592b6' |
+            Set-Content (Join-Path $env:CGC_VALIDATION_ROOT 'bootstrap.log') -Encoding utf8NoBOM
+          $disk = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($env:CGC_VALIDATION_ROOT))
+          if ($disk.AvailableFreeSpace -lt 12000000000) { throw 'Resource gate: less than 12 GB free' }
+
+      - name: Check out the exact PR source with no persisted credential
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: DivyamTalwar/CodeGraphContext
+          ref: 63e4c8c7774cdac58c4790e01379a26db47592b6
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.14'
+
+      - name: Install project and development dependencies in this run's venv
+        working-directory: ${{ env.CGC_SOURCE_ROOT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -cne '63e4c8c7774cdac58c4790e01379a26db47592b6') {
+            throw "Unexpected checkout: $actual"
+          }
+          & git diff --exit-code -- .
+          if ($LASTEXITCODE -ne 0) { throw 'Source is already modified' }
+          $disk = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($env:CGC_VALIDATION_ROOT))
+          if ($disk.AvailableFreeSpace -lt 12000000000) { throw 'Resource gate: less than 12 GB free' }
+          $env:TEMP = Join-Path $env:CGC_VALIDATION_ROOT 'tmp'
+          $env:TMP = $env:TEMP
+          & python -B -m venv (Join-Path $env:CGC_VALIDATION_ROOT 'venv')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testPython = Join-Path $env:CGC_VALIDATION_ROOT 'venv/Scripts/python.exe'
+          & $testPython -B -m pip install --no-cache-dir --log (Join-Path $env:CGC_VALIDATION_ROOT 'install-pip.log') '.[dev]' 'ladybug==0.19.1' 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:CGC_VALIDATION_ROOT 'install-console.log')
+          $installExit = $LASTEXITCODE
+          $installExit | Set-Content (Join-Path $env:CGC_VALIDATION_ROOT 'install-exit.txt') -Encoding utf8NoBOM
+          if ($installExit -ne 0) { exit $installExit }
+          $growth = (Get-ChildItem -LiteralPath $env:CGC_VALIDATION_ROOT -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          $disk = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($env:CGC_VALIDATION_ROOT))
+          if ($growth -gt 3000000000 -or $disk.AvailableFreeSpace -lt 12000000000) {
+            throw "Resource gate after install: owned bytes=$growth; free bytes=$($disk.AvailableFreeSpace)"
+          }
+
+      - name: Run native Windows and polling fresh-database regressions
+        working-directory: ${{ env.CGC_SOURCE_ROOT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $env:TEMP = Join-Path $env:CGC_VALIDATION_ROOT 'tmp'
+          $env:TMP = $env:TEMP
+          @'
+          import functools
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+
+          root = Path(os.environ['CGC_VALIDATION_ROOT']).resolve()
+          source = Path(os.environ['CGC_SOURCE_ROOT']).resolve()
+          expected_commit = '63e4c8c7774cdac58c4790e01379a26db47592b6'
+          integration = 'tests/integration/test_watcher_watch_first.py'
+          selection = [
+              'tests/unit/core/test_watcher_repository_initialization.py',
+              'tests/unit/core/test_watcher_startup_sync.py',
+              'tests/unit/core/test_watcher_polling_observer.py',
+              'tests/unit/tools/test_writer_path_normalization.py',
+              'tests/unit/tools/test_repo_path_normalization.py',
+              'tests/unit/tools/test_graph_builder_perf_fixes.py::TestDeleteRepositoryFromGraph::test_finds_repo_stored_with_backslash_path',
+              integration,
+          ]
+
+          def budget(stage):
+              owned = sum(path.stat().st_size for path in root.rglob('*') if path.is_file())
+              free = shutil.disk_usage(root).free
+              print(json.dumps({'resource_stage': stage, 'owned_bytes': owned, 'free_bytes': free}), flush=True)
+              if owned > 3_000_000_000 or free < 12_000_000_000:
+                  raise RuntimeError('Resource gate: max 3 GB owned output, min 12 GB disk free')
+
+          budget('before imports')
+          if sys.platform != 'win32' or sys.version_info[:2] != (3, 14):
+              raise RuntimeError('This gate requires real Windows and Python 3.14')
+          actual_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
+          if actual_commit != expected_commit:
+              raise RuntimeError(f'Unexpected source commit: {actual_commit}')
+          subprocess.run(['git', 'diff', '--exit-code', '--', '.'], cwd=source, check=True)
+          sys.path.insert(0, str(source / 'src'))
+          sys.dont_write_bytecode = True
+
+          # config_manager has no config-root environment override. Redirect its
+          # path constants before importing any consumer; do not read host config.
+          from codegraphcontext.cli import config_manager as config
+          config.CONFIG_DIR = root / 'config'
+          config.CONFIG_FILE = config.CONFIG_DIR / '.env'
+          config.CONTEXT_CONFIG_FILE = config.CONFIG_DIR / 'config.yaml'
+          config._LEGACY_CONTEXT_CONFIG_FILE = config.CONFIG_DIR / 'cgc_config.yaml'
+          config._FIRST_RUN_MARKER = config.CONFIG_DIR / '.first_run_done'
+          config._LEGACY_FALKORDB_PATH = config.CONFIG_DIR / 'global' / 'falkordb.db'
+          scoped = {
+              'LADYBUGDB_PATH': str(root / 'db' / 'ladybugdb'),
+              'KUZUDB_PATH': str(root / 'db' / 'kuzudb'),
+              'FALKORDB_PATH': str(root / 'db' / 'falkordb'),
+              'FALKORDB_SOCKET_PATH': str(root / 'db' / 'falkordb.sock'),
+              'DEBUG_LOG_PATH': str(root / 'debug.log'),
+              'LOG_FILE_PATH': str(root / 'app.log'),
+              'DEFAULT_DATABASE': 'ladybugdb',
+              'ENABLE_APP_LOGS': 'WARNING',
+          }
+          config.DEFAULT_CONFIG = {**config.DEFAULT_CONFIG, **scoped}
+          os.environ.update(scoped)
+
+          import ladybug
+          if importlib.metadata.version('ladybug') != '0.19.1':
+              raise RuntimeError('The Ladybug dependency must be exactly 0.19.1')
+          # Supported public resource parameters only; no query, observer,
+          # assertion, skip, path-normalization, or production-source changes.
+          ladybug.Connection = functools.partial(ladybug.Connection, num_threads=2)
+          import tree_sitter_language_pack as pack
+          pack.configure(pack.PackConfig(cache_dir=str(root / 'grammar-cache')))
+          pack.prefetch(['python'])
+
+          from watchdog.observers.polling import PollingObserver
+          from watchdog.observers.read_directory_changes import WindowsApiObserver
+          from codegraphcontext.core import watcher
+          if Path(watcher.__file__).resolve() != source / 'src/codegraphcontext/core/watcher.py':
+              raise RuntimeError('Tests imported a different source tree')
+          native = watcher.CodeWatcher(object(), use_polling=False).observer
+          polling = watcher.CodeWatcher(object(), use_polling=True).observer
+          if type(native) is not WindowsApiObserver or type(polling) is not PollingObserver:
+              raise RuntimeError('Expected real WindowsApiObserver and PollingObserver without substitution')
+
+          source_files = [
+              'src/codegraphcontext/core/watcher.py',
+              'src/codegraphcontext/tools/graph_builder.py',
+              'src/codegraphcontext/tools/indexing/persistence/writer.py',
+              *(node.split('::', 1)[0] for node in selection),
+          ]
+          hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in source_files}
+          manifest = {
+              'source_repository': 'DivyamTalwar/CodeGraphContext',
+              'source_commit': actual_commit,
+              'source_sha256': hashes,
+              'python': sys.version,
+              'ladybug': importlib.metadata.version('ladybug'),
+              'watchdog': importlib.metadata.version('watchdog'),
+              'tree_sitter_language_pack': importlib.metadata.version('tree-sitter-language-pack'),
+              'native_observer': f'{type(native).__module__}.{type(native).__name__}',
+              'polling_observer': f'{type(polling).__module__}.{type(polling).__name__}',
+              'embedded_buffer_pool_mib': 1024,
+              'connection_query_threads': 2,
+              'selection': selection,
+          }
+          (root / 'source-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+          print(json.dumps(manifest, indent=2), flush=True)
+
+          import pytest
+
+          class ExecutionGuard:
+              def __init__(self):
+                  self.collected = set()
+                  self.call_outcomes = {}
+
+              def pytest_collection_modifyitems(self, items):
+                  self.collected = {item.nodeid for item in items}
+
+              def pytest_runtest_logreport(self, report):
+                  if report.when == 'call':
+                      self.call_outcomes[report.nodeid] = report.outcome
+
+          guard = ExecutionGuard()
+          args = [
+              '-q', '-rs', '-p', 'no:cacheprovider',
+              '-W', 'error::pytest.PytestUnhandledThreadExceptionWarning',
+              '--basetemp', str(root / 'pytest-tmp'),
+              '--junitxml', str(root / 'junit.xml'),
+              *selection,
+          ]
+          print('pytest arguments: ' + json.dumps(args), flush=True)
+          budget('before pytest')
+          pytest_exit = int(pytest.main(args, plugins=[guard]))
+          required = {
+              f'{integration}::test_watch_first_initializes_repository_before_live_events[{mode}-{observer}]'
+              for mode in ['events-only', 'startup-sync', 'initial-scan']
+              for observer in ['native', 'polling']
+          } | {
+              f'{integration}::test_watch_attachment_preserves_metadata_unless_scanning[False]',
+              f'{integration}::test_watch_attachment_preserves_metadata_unless_scanning[True]',
+              f'{integration}::test_watch_registration_preserves_a_concurrent_index_write',
+              'tests/unit/tools/test_writer_path_normalization.py::TestDeleteRepositoryFromGraph::test_normalized_path_used_for_lookup',
+              'tests/unit/tools/test_writer_path_normalization.py::TestDeleteFileFromGraph::test_normalized_path_used',
+              'tests/unit/tools/test_graph_builder_perf_fixes.py::TestDeleteRepositoryFromGraph::test_finds_repo_stored_with_backslash_path',
+              'tests/unit/core/test_watcher_startup_sync.py::test_startup_sync_does_not_delete_windows_paths_that_are_still_on_disk',
+          }
+          missing = sorted(required - guard.collected)
+          not_passed = sorted(node for node in guard.collected if guard.call_outcomes.get(node) != 'passed')
+          result = {
+              'pytest_exit': pytest_exit,
+              'collected_count': len(guard.collected),
+              'ladybug_integration_collected': len([node for node in guard.collected if node.startswith(integration + '::')]),
+              'missing_required': missing,
+              'not_passed': not_passed,
+              'call_outcomes': guard.call_outcomes,
+          }
+          final_exit = pytest_exit if pytest_exit else int(bool(missing or not_passed))
+          result['final_exit'] = final_exit
+          (root / 'execution-guard.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          print(json.dumps(result, indent=2), flush=True)
+          subprocess.run(['git', 'diff', '--exit-code', '--', '.'], cwd=source, check=True)
+          budget('after pytest')
+          raise SystemExit(final_exit)
+          '@ | Set-Content (Join-Path $env:CGC_VALIDATION_ROOT 'run-validation.py') -Encoding utf8NoBOM
+          $testPython = Join-Path $env:CGC_VALIDATION_ROOT 'venv/Scripts/python.exe'
+          & $testPython -B (Join-Path $env:CGC_VALIDATION_ROOT 'run-validation.py') 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:CGC_VALIDATION_ROOT 'pytest.log')
+          $pytestExit = $LASTEXITCODE
+          $pytestExit | Set-Content (Join-Path $env:CGC_VALIDATION_ROOT 'pytest-exit.txt') -Encoding utf8NoBOM
+          exit $pytestExit
+
+      - name: Upload logs and JUnit even after failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: cgc1873-windows-63e4c8c-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ env.CGC_VALIDATION_ROOT }}/*.log
+            ${{ env.CGC_VALIDATION_ROOT }}/*-exit.txt
+            ${{ env.CGC_VALIDATION_ROOT }}/junit.xml
+            ${{ env.CGC_VALIDATION_ROOT }}/source-manifest.json
+            ${{ env.CGC_VALIDATION_ROOT }}/execution-guard.json
+            ${{ env.CGC_VALIDATION_ROOT }}/run-validation.py
