@@ -173,7 +173,19 @@ jobs:
           os.environ.update(scoped)
 
           # Keep DLL dependency lookup alive for the lifetime of this process.
-          native_dll_dir = os.add_dll_directory(str(Path(os.environ['LBUG_C_API_LIB_PATH']).parent))
+          native_dll_dirs = [os.add_dll_directory(str(Path(os.environ['LBUG_C_API_LIB_PATH']).parent))]
+          # The official Ladybug DLL imports OpenSSL3 DLLs not bundled in its zip.
+          # Use the hosted image's installed OpenSSL/Git runtime, never a random DLL download.
+          program_files = Path(os.environ['ProgramFiles'])
+          candidates = [program_files / 'OpenSSL' / 'bin', program_files / 'OpenSSL-Win64' / 'bin', program_files / 'Git' / 'mingw64' / 'bin']
+          candidates += [p / 'bin' for p in program_files.glob('OpenSSL*') if p.is_dir()]
+          provider = next((p for p in candidates if all((p / name).is_file() for name in ['libssl-3-x64.dll', 'libcrypto-3-x64.dll'])), None)
+          if provider is None:
+              raise RuntimeError('Hosted runner has no compatible installed OpenSSL3 runtime for official Ladybug DLL')
+          native_dll_dirs.append(os.add_dll_directory(str(provider)))
+          openssl_runtime = {name: {'path': str(provider / name), 'sha256': hashlib.sha256((provider / name).read_bytes()).hexdigest()} for name in ['libssl-3-x64.dll', 'libcrypto-3-x64.dll']}
+          (root / 'openssl-runtime.json').write_text(json.dumps(openssl_runtime, indent=2), encoding='utf-8')
+          print('OpenSSL runtime: ' + json.dumps(openssl_runtime), flush=True)
           import ladybug
           if importlib.metadata.version('ladybug') != '0.19.1':
               raise RuntimeError('The Ladybug dependency must be exactly 0.19.1')
@@ -292,6 +304,7 @@ jobs:
             ${{ env.CGC_VALIDATION_ROOT }}/*.log
             ${{ env.CGC_VALIDATION_ROOT }}/*-exit.txt
             ${{ env.CGC_VALIDATION_ROOT }}/junit.xml
+            ${{ env.CGC_VALIDATION_ROOT }}/openssl-runtime.json
             ${{ env.CGC_VALIDATION_ROOT }}/native-library.json
             ${{ env.CGC_VALIDATION_ROOT }}/source-manifest.json
             ${{ env.CGC_VALIDATION_ROOT }}/execution-guard.json
