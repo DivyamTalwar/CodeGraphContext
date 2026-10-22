@@ -20,7 +20,7 @@ jobs:
         shell: pwsh
     env:
       CGC_SOURCE_ROOT: ${{ github.workspace }}/source
-      CGC_VALIDATION_ROOT: ${{ runner.temp }}/cgc1873-${{ github.run_id }}-${{ github.run_attempt }}
+      CGC_VALIDATION_ROOT: ${{ github.workspace }}/cgc1873-${{ github.run_id }}-${{ github.run_attempt }}
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONUTF8: '1'
       CGC_IGNORE_PROJECT_ENV: '1'
